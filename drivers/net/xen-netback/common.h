@@ -214,6 +214,15 @@ struct xenvif_queue { /* Per-queue data for xenvif */
 	struct gnttab_copy tx_copy_ops[2 * MAX_PENDING_REQS];
 	struct gnttab_map_grant_ref tx_map_ops[MAX_PENDING_REQS];
 	struct gnttab_unmap_grant_ref tx_unmap_ops[MAX_PENDING_REQS];
+
+	/* Tree to store the TX grants
+	 * Only used if feature-persistent = 1
+	 */
+	struct persistent_gnt_tree tx_gnts_tree;
+	struct page *tx_gnts_pages[XEN_NETIF_TX_RING_SIZE];
+	/* persistent grants in use */
+	struct persistent_gnt *tx_pgrants[MAX_PENDING_REQS];
+
 	/* passed to gnttab_[un]map_refs with pages under (un)mapping */
 	struct page *pages_to_map[MAX_PENDING_REQS];
 	struct page *pages_to_unmap[MAX_PENDING_REQS];
@@ -426,6 +435,9 @@ void xenvif_zerocopy_callback(struct ubuf_info *ubuf, bool zerocopy_success);
 
 /* Unmap a pending page and release it back to the guest */
 void xenvif_idx_unmap(struct xenvif_queue *queue, u16 pending_idx);
+void xenvif_page_unmap(struct xenvif_queue *queue,
+		       grant_handle_t handle,
+		       struct page **page);
 
 static inline pending_ring_idx_t nr_pending_reqs(struct xenvif_queue *queue)
 {

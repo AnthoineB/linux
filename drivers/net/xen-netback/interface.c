@@ -566,6 +566,34 @@ struct xenvif *xenvif_alloc(struct device *parent, domid_t domid,
 	return vif;
 }
 
+static int init_persistent_gnt_tree(struct persistent_gnt_tree *tree,
+				    struct page **pages, int max)
+{
+	int err;
+
+	tree->gnt_max = min_t(unsigned, max, xenvif_max_pgrants);
+	tree->root.rb_node = NULL;
+	atomic_set(&tree->gnt_in_use, 0);
+
+	err = gnttab_alloc_pages(tree->gnt_max, pages);
+	if (!err) {
+		tree->free_pages_num = 0;
+		INIT_LIST_HEAD(&tree->free_pages);
+		put_free_pages(tree, pages, tree->gnt_max);
+	}
+
+	return err;
+}
+
+static void deinit_persistent_gnt_tree(struct persistent_gnt_tree *tree,
+				       struct page **pages)
+{
+	free_persistent_gnts(tree, tree->gnt_c);
+	BUG_ON(!RB_EMPTY_ROOT(&tree->root));
+	tree->gnt_c = 0;
+	gnttab_free_pages(tree->gnt_max, pages);
+}
+
 int xenvif_init_queue(struct xenvif_queue *queue)
 {
 	int err, i;
@@ -605,8 +633,22 @@ int xenvif_init_queue(struct xenvif_queue *queue)
 			  { { .ctx = NULL,
 			      .desc = i } } };
 		queue->grant_tx_handle[i] = NETBACK_INVALID_HANDLE;
+		queue->tx_pgrants[i] = NULL;
 	}
 
+	if (queue->vif->persistent_grants) {
+		err = init_persistent_gnt_tree(&queue->tx_gnts_tree,
+					       queue->tx_gnts_pages,
+					       XEN_NETIF_TX_RING_SIZE);
+		if (err)
+			goto err_disable;
+	}
+
+	return 0;
+
+err_disable:
+	netdev_err(queue->vif->dev, "Could not reserve tree pages.");
+	queue->vif->persistent_grants = 0;
 	return 0;
 }
 
@@ -814,6 +856,10 @@ void xenvif_disconnect_data(struct xenvif *vif)
 		}
 
 		xenvif_unmap_frontend_data_rings(queue);
+
+		if (queue->vif->persistent_grants)
+			deinit_persistent_gnt_tree(&queue->tx_gnts_tree,
+						   queue->tx_gnts_pages);
 	}
 
 	xenvif_mcast_addr_list_free(vif);
