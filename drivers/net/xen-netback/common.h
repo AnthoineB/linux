@@ -106,6 +106,48 @@ struct xenvif_rx_meta {
 /* IRQ name is queue name with "-tx" or "-rx" appended */
 #define IRQ_NAME_SIZE (QUEUE_NAME_SIZE + 3)
 
+/* Number of available flags */
+#define PERSISTENT_GNT_FLAGS_SIZE      2
+/* This persistent grant is currently in use */
+#define PERSISTENT_GNT_ACTIVE          0
+/* This persistent grant has been used, this flag is set when we remove the
+ * PERSISTENT_GNT_ACTIVE, to know that this grant has been used recently.
+ */
+#define PERSISTENT_GNT_WAS_ACTIVE      1
+
+struct persistent_gnt {
+	struct page *page; /* mapped page */
+	grant_ref_t gnt;
+	grant_handle_t handle;
+	DECLARE_BITMAP(flags, PERSISTENT_GNT_FLAGS_SIZE);
+	struct rb_node node;
+};
+
+struct persistent_gnt_tree {
+	/* Tree to store persistent grants */
+	struct rb_root root;
+
+	/* Number of grants in use */
+	atomic_t gnt_in_use;
+
+	/* Number of grants in the tree */
+	unsigned int gnt_c;
+
+	/* Maximum number of grants in the tree */
+	unsigned int gnt_max;
+
+	/* True if we reached maximum number of
+	 * persistent grants in the tree
+	 */
+	bool overflow;
+
+	/* Free pages for grant maps */
+	struct list_head free_pages;
+
+	/* Initialized with <gnt_max> pages */
+	unsigned int free_pages_num;
+};
+
 struct xenvif;
 
 struct xenvif_stats {
@@ -224,6 +266,7 @@ struct xenvif {
 	u8 can_sg:1;
 	u8 ip_csum:1;
 	u8 ipv6_csum:1;
+	u8 persistent_grants:1;
 
 	/* Is this interface disabled? True when backend discovers
 	 * frontend is rogue.
@@ -343,5 +386,19 @@ extern struct dentry *xen_netback_dbg_root;
 void xenvif_skb_zerocopy_prepare(struct xenvif_queue *queue,
 				 struct sk_buff *skb);
 void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue);
+
+/* tree ops for persistent grants */
+struct persistent_gnt *get_persistent_gnt(struct persistent_gnt_tree *tree,
+					  grant_ref_t gref);
+int add_persistent_gnt(struct persistent_gnt_tree *tree,
+		       struct persistent_gnt *persistent_gnt);
+void put_persistent_gnt(struct persistent_gnt_tree *tree,
+			struct persistent_gnt *persistent_gnt);
+void free_persistent_gnts(struct persistent_gnt_tree *tree, unsigned int num);
+/* Gets one page from the free pool in the tree */
+int get_free_page(struct persistent_gnt_tree *tree, struct page **page);
+/* Adds pages to the free pool in the tree */
+void put_free_pages(struct persistent_gnt_tree *tree, struct page **page,
+		    int num);
 
 #endif /* __XEN_NETBACK__COMMON_H__ */
