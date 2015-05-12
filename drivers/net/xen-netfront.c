@@ -255,6 +255,42 @@ static void xennet_maybe_wake_tx(struct netfront_queue *queue)
 		netif_tx_wake_queue(netdev_get_tx_queue(dev, queue->id));
 }
 
+static grant_ref_t claim_grant(unsigned long gfn,
+			       grant_ref_t *gref_head,
+			       int otherend_id,
+			       int flags)
+{
+	grant_ref_t ref;
+	unsigned long gfn;
+
+	ref = gnttab_claim_grant_reference(gref_head);
+	BUG_ON((signed short)ref < 0);
+
+	gnttab_grant_foreign_access_ref(
+		ref, otherend_id, gfn, flags);
+
+	return ref;
+}
+
+static void release_grant(grant_ref_t ref,
+			  grant_ref_t *gref_head,
+			  int otherend_id,
+			  int flags)
+{
+	int ret;
+
+	if (unlikely(gnttab_query_foreign_access(
+		ref) != 0)) {
+		pr_alert("%s: warning -- grant still in use by backend domain\n",
+			 __func__);
+		BUG();
+	}
+
+	ret = gnttab_end_foreign_access_ref(ref, flags);
+	BUG_ON(!ret);
+
+	gnttab_release_grant_reference(gref_head, ref);
+}
 
 static struct sk_buff *xennet_alloc_one_rx_buffer(struct netfront_queue *queue)
 {
@@ -296,7 +332,7 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 		struct sk_buff *skb;
 		unsigned short id;
 		grant_ref_t ref;
-		struct page *page;
+		unsigned long gfn;
 		struct xen_netif_rx_request *req;
 
 		skb = xennet_alloc_one_rx_buffer(queue);
@@ -308,17 +344,16 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 		BUG_ON(queue->rx_skbs[id]);
 		queue->rx_skbs[id] = skb;
 
-		ref = gnttab_claim_grant_reference(&queue->gref_rx_head);
-		BUG_ON((signed short)ref < 0);
+		gfn = xen_page_to_gfn(skb_frag_page(&skb_shinfo(skb)->frags[0]));
+		ref = claim_grant(gfn,
+				  &queue->gref_rx_head,
+				  queue->info->xbdev->otherend_id,
+				  0);
+
 		queue->grant_rx[id].ref = ref;
 
-		page = skb_frag_page(&skb_shinfo(skb)->frags[0]);
-
 		req = RING_GET_REQUEST(&queue->rx, req_prod);
-		gnttab_page_grant_foreign_access_ref_one(ref,
-							 queue->info->xbdev->otherend_id,
-							 page,
-							 0);
+
 		req->id = id;
 		req->gref = ref;
 	}
@@ -385,16 +420,12 @@ static void xennet_tx_buf_gc(struct netfront_queue *queue)
 
 			id  = txrsp->id;
 			skb = queue->tx_skbs[id].skb;
-			if (unlikely(gnttab_query_foreign_access(
-				queue->grant_tx[id].ref) != 0)) {
-				pr_alert("%s: warning -- grant still in use by backend domain\n",
-					 __func__);
-				BUG();
-			}
-			gnttab_end_foreign_access_ref(
-				queue->grant_tx[id].ref, GNTMAP_readonly);
-			gnttab_release_grant_reference(
-				&queue->gref_tx_head, queue->grant_tx[id].ref);
+
+			release_grant(queue->grant_tx[id].ref,
+				      &queue->gref_tx_head,
+				      queue->info->xbdev->otherend_id,
+				      GNTMAP_readonly);
+
 			queue->grant_tx[id].ref = GRANT_INVALID_REF;
 			queue->grant_tx[id].page = NULL;
 			add_id_to_freelist(&queue->tx_skb_freelist, queue->tx_skbs, id);
@@ -441,11 +472,10 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 
 	id = get_id_from_freelist(&queue->tx_skb_freelist, queue->tx_skbs);
 	tx = RING_GET_REQUEST(&queue->tx, queue->tx.req_prod_pvt++);
-	ref = gnttab_claim_grant_reference(&queue->gref_tx_head);
-	BUG_ON((signed short)ref < 0);
-
-	gnttab_grant_foreign_access_ref(ref, queue->info->xbdev->otherend_id,
-					gfn, GNTMAP_readonly);
+	ref = claim_grant(gfn,
+			  &queue->gref_tx_head,
+			  queue->info->xbdev->otherend_id,
+			  GNTMAP_readonly);
 
 	queue->tx_skbs[id].skb = skb;
 	queue->grant_tx[id].page = page;
@@ -778,7 +808,6 @@ static int xennet_get_responses(struct netfront_queue *queue,
 	int max = MAX_SKB_FRAGS + (rx->status <= RX_COPY_THRESHOLD);
 	int slots = 1;
 	int err = 0;
-	unsigned long ret;
 
 	if (rx->flags & XEN_NETRXF_extra_info) {
 		err = xennet_get_extras(queue, extras, rp);
@@ -809,10 +838,10 @@ static int xennet_get_responses(struct netfront_queue *queue,
 			goto next;
 		}
 
-		ret = gnttab_end_foreign_access_ref(ref, 0);
-		BUG_ON(!ret);
-
-		gnttab_release_grant_reference(&queue->gref_rx_head, ref);
+		release_grant(ref,
+			      &queue->gref_rx_head,
+			      queue->info->xbdev->otherend_id,
+			      0);
 
 		__skb_queue_tail(list, skb);
 
