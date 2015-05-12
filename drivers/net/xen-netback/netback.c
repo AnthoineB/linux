@@ -72,6 +72,11 @@ module_param_named(max_queues, xenvif_max_queues, uint, 0644);
 MODULE_PARM_DESC(max_queues,
 		 "Maximum number of queues per virtual interface");
 
+unsigned int xenvif_max_pgrants = XEN_NETIF_RX_RING_SIZE;
+module_param_named(max_persistent_grants, xenvif_max_pgrants, int, 0644);
+MODULE_PARM_DESC(max_persistent_grants,
+		 "Maximum number of grants to map persistently");
+
 /*
  * This is the maximum slots a skb can have. If a guest sends a skb
  * which exceeds this limit it is considered malicious.
