@@ -391,6 +391,14 @@ static int netback_probe(struct xenbus_device *dev,
 		goto fail;
 	}
 
+	/* Persistent grants support. This is an optional feature. */
+	err = xenbus_printf(XBT_NIL, dev->nodename,
+			    "feature-persistent", "%d", xenvif_max_pgrants > 0);
+	if (err) {
+		message = "writing feature-persistent";
+		goto abort_transaction;
+	}
+
 	/*
 	 * Split event channels support, this is optional so it is not
 	 * put inside the above loop.
@@ -1202,6 +1210,11 @@ static int read_xenbus_vif_flags(struct backend_info *be)
 	}
 
 	vif->can_sg = !!xenbus_read_unsigned(dev->otherend, "feature-sg", 0);
+
+	if (xenbus_scanf(XBT_NIL, dev->otherend, "feature-persistent",
+			 "%d", &err) < 0)
+		err = 0;
+	vif->persistent_grants = (xenvif_max_pgrants && !!err);
 
 	vif->gso_mask = 0;
 
