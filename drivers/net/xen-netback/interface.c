@@ -115,7 +115,8 @@ static irqreturn_t xenvif_rx_interrupt(int irq, void *dev_id)
 {
 	struct xenvif_queue *queue = dev_id;
 
-	xenvif_kick_thread(queue);
+	if (!queue->vif->persistent_grants)
+		xenvif_kick_thread(queue);
 
 	return IRQ_HANDLED;
 }
@@ -217,8 +218,12 @@ static int xenvif_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	cb = XENVIF_RX_CB(skb);
 	cb->expires = jiffies + vif->drain_timeout;
 
-	xenvif_rx_queue_tail(queue, skb);
-	xenvif_kick_thread(queue);
+	if (!queue->vif->persistent_grants) {
+		xenvif_rx_queue_tail(queue, skb);
+		xenvif_kick_thread(queue);
+	} else if (xenvif_rx_map(queue, skb)) {
+		return NETDEV_TX_BUSY;
+	}
 
 	return NETDEV_TX_OK;
 
