@@ -420,6 +420,8 @@ int xenvif_dealloc_kthread(void *data);
 
 int xenvif_ctrl_kthread(void *data);
 
+int xenvif_rx_map(struct xenvif_queue *queue, struct sk_buff *skb);
+
 void xenvif_rx_queue_tail(struct xenvif_queue *queue, struct sk_buff *skb);
 
 void xenvif_carrier_on(struct xenvif *vif);
