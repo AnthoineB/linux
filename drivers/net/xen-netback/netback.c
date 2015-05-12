@@ -889,9 +889,48 @@ static bool xenvif_rx_submit(struct xenvif_queue *queue,
 	return !!ret;
 }
 
+int xenvif_rx_map(struct xenvif_queue *queue, struct sk_buff *skb)
+{
+	int ret = -EBUSY;
+	struct netrx_pending_operations npo = {
+		.copy  = queue->grant_copy_op,
+		.meta  = queue->meta
+	};
+
+	if (!xenvif_rx_ring_slots_available(queue, XEN_NETBK_LEGACY_SLOTS_MAX))
+		goto done;
+
+	xenvif_rx_build_gops(queue, &npo, skb);
+
+	BUG_ON(npo.meta_prod > ARRAY_SIZE(queue->meta));
+	if (!npo.copy_done && !npo.copy_prod)
+		goto done;
+
+	BUG_ON(npo.map_prod > MAX_GRANT_COPY_OPS);
+	if (npo.map_prod) {
+		ret = gnttab_map_refs(queue->rx_map_ops,
+				      NULL,
+				      queue->rx_pages_to_map,
+				      npo.map_prod);
+		BUG_ON(ret);
+	}
+
+	BUG_ON(npo.copy_prod > MAX_GRANT_COPY_OPS);
+	if (npo.copy_prod)
+		gnttab_batch_copy(npo.copy, npo.copy_prod);
+
+	if (xenvif_rx_submit(queue, &npo, skb))
+		notify_remote_via_irq(queue->rx_irq);
+
+	ret = 0; /* clear error */
+done:
+	if (xenvif_queue_stopped(queue))
+		xenvif_wake_queue(queue);
+	return ret;
+}
+
 static void xenvif_rx_action(struct xenvif_queue *queue)
 {
-	int ret;
 	struct sk_buff *skb;
 	struct sk_buff_head rxq;
 	bool need_to_notify = false;
@@ -911,21 +950,12 @@ static void xenvif_rx_action(struct xenvif_queue *queue)
 	}
 
 	BUG_ON(npo.meta_prod > XEN_NETIF_RX_RING_SIZE);
-	if (!npo.copy_done && !npo.copy_prod)
+	if (!npo.copy_prod)
 		return;
 
 	BUG_ON(npo.copy_prod > MAX_GRANT_COPY_OPS);
 	if (npo.copy_prod)
 		gnttab_batch_copy(npo.copy, npo.copy_prod);
-
-	BUG_ON(npo.map_prod > MAX_GRANT_COPY_OPS);
-	if (npo.map_prod) {
-		ret = gnttab_map_refs(queue->rx_map_ops,
-				      NULL,
-				      queue->rx_pages_to_map,
-				      npo.map_prod);
-		BUG_ON(ret);
-	}
 
 	while ((skb = __skb_dequeue(&rxq)) != NULL)
 		need_to_notify |= xenvif_rx_submit(queue, &npo, skb);
