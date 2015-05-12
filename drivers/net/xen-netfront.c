@@ -161,6 +161,8 @@ struct netfront_info {
 	struct netfront_stats __percpu *tx_stats;
 
 	atomic_t rx_gso_checksum_fixup;
+
+	unsigned int feature_persistent:1;
 };
 
 struct netfront_rx_info {
@@ -1961,6 +1963,12 @@ again:
 		goto abort_transaction;
 	}
 
+	err = xenbus_write(xbt, dev->nodename, "feature-persistent", "1");
+	if (err) {
+		message = "writing feature-persistent";
+		goto abort_transaction;
+	}
+
 	err = xenbus_transaction_end(xbt, 0);
 	if (err) {
 		if (err == -EAGAIN)
@@ -1989,6 +1997,7 @@ static int xennet_connect(struct net_device *dev)
 	unsigned int num_queues = 0;
 	int err;
 	unsigned int feature_rx_copy;
+	unsigned int feature_persistent;
 	unsigned int j = 0;
 	struct netfront_queue *queue = NULL;
 
@@ -2002,6 +2011,13 @@ static int xennet_connect(struct net_device *dev)
 			 "backend does not support copying receive path\n");
 		return -ENODEV;
 	}
+
+	err = xenbus_gather(XBT_NIL, np->xbdev->otherend,
+			    "feature-persistent", "%u", &feature_persistent,
+			    NULL);
+	if (err)
+		feature_persistent = 0;
+	np->feature_persistent = !!feature_persistent;
 
 	err = talk_to_netback(np->xbdev, np);
 	if (err)
