@@ -374,6 +374,7 @@ extern bool separate_tx_rx_irq;
 extern unsigned int rx_drain_timeout_msecs;
 extern unsigned int rx_stall_timeout_msecs;
 extern unsigned int xenvif_max_queues;
+extern unsigned int xenvif_max_pgrants;
 
 #ifdef CONFIG_DEBUG_FS
 extern struct dentry *xen_netback_dbg_root;
