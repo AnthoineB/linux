@@ -125,6 +125,13 @@ static int xenvif_read_io_ring(struct seq_file *m, void *v)
 		   skb_queue_len(&queue->rx_queue),
 		   netif_tx_queue_stopped(dev_queue) ? "stopped" : "running");
 
+	if (queue->vif->persistent_grants) {
+		seq_printf(m, "\nTx persistent_gnts: in_use %d max %d gnts %d\n",
+			   atomic_read(&queue->tx_gnts_tree.gnt_in_use),
+			   queue->tx_gnts_tree.gnt_max,
+			   queue->tx_gnts_tree.gnt_c);
+	}
+
 	return 0;
 }
 
