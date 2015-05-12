@@ -800,16 +800,100 @@ void xenvif_kick_thread(struct xenvif_queue *queue)
 	wake_up(&queue->wq);
 }
 
-static void xenvif_rx_action(struct xenvif_queue *queue)
+static void xenvif_rx_build_gops(struct xenvif_queue *queue,
+				 struct netrx_pending_operations *npo,
+				 struct sk_buff *skb)
+{
+        queue->last_rx_time = jiffies;
+
+        XENVIF_RX_CB(skb)->meta_slots_used = xenvif_gop_skb(skb, &npo, queue);
+}
+
+static bool xenvif_rx_submit(struct xenvif_queue *queue,
+			     struct netrx_pending_operations *npo,
+			     struct sk_buff *skb)
 {
 	s8 status;
 	u16 flags;
 	struct xen_netif_rx_response *resp;
-	struct sk_buff_head rxq;
-	struct sk_buff *skb;
 	LIST_HEAD(notify);
 	int ret;
 	unsigned long offset;
+
+	if ((1 << queue->meta[npo->meta_cons].gso_type) &
+	    queue->vif->gso_prefix_mask) {
+		resp = RING_GET_RESPONSE(&queue->rx,
+					 queue->rx.rsp_prod_pvt++);
+
+		resp->flags = XEN_NETRXF_gso_prefix | XEN_NETRXF_more_data;
+
+		resp->offset = queue->meta[npo->meta_cons].gso_size;
+		resp->id = queue->meta[npo->meta_cons].id;
+		resp->status = XENVIF_RX_CB(skb)->meta_slots_used;
+
+		npo->meta_cons++;
+		XENVIF_RX_CB(skb)->meta_slots_used--;
+	}
+
+	queue->stats.tx_bytes += skb->len;
+	queue->stats.tx_packets++;
+
+	status = xenvif_check_gop(queue,
+				  XENVIF_RX_CB(skb)->meta_slots_used,
+				  npo);
+
+	if (XENVIF_RX_CB(skb)->meta_slots_used == 1)
+		flags = 0;
+	else
+		flags = XEN_NETRXF_more_data;
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL) /* local packet? */
+		flags |= XEN_NETRXF_csum_blank | XEN_NETRXF_data_validated;
+	else if (skb->ip_summed == CHECKSUM_UNNECESSARY)
+		/* remote but checksummed. */
+		flags |= XEN_NETRXF_data_validated;
+
+	offset = 0;
+	resp = make_rx_response(queue, queue->meta[npo->meta_cons].id,
+				status, offset,
+				queue->meta[npo->meta_cons].size,
+				flags);
+
+	if ((1 << queue->meta[npo->meta_cons].gso_type) &
+	    queue->vif->gso_mask) {
+		struct xen_netif_extra_info *gso =
+			(struct xen_netif_extra_info *)
+			RING_GET_RESPONSE(&queue->rx,
+					  queue->rx.rsp_prod_pvt++);
+
+		resp->flags |= XEN_NETRXF_extra_info;
+
+		gso->u.gso.type = queue->meta[npo->meta_cons].gso_type;
+		gso->u.gso.size = queue->meta[npo->meta_cons].gso_size;
+		gso->u.gso.pad = 0;
+		gso->u.gso.features = 0;
+
+		gso->type = XEN_NETIF_EXTRA_TYPE_GSO;
+		gso->flags = 0;
+	}
+
+	xenvif_add_frag_responses(queue, status,
+				  queue->meta + npo->meta_cons + 1,
+				  XENVIF_RX_CB(skb)->meta_slots_used);
+
+	RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&queue->rx, ret);
+
+	npo->meta_cons += XENVIF_RX_CB(skb)->meta_slots_used;
+	dev_kfree_skb(skb);
+
+	return !!ret;
+}
+
+static void xenvif_rx_action(struct xenvif_queue *queue)
+{
+	int ret;
+	struct sk_buff *skb;
+	struct sk_buff_head rxq;
 	bool need_to_notify = false;
 
 	struct netrx_pending_operations npo = {
@@ -821,16 +905,14 @@ static void xenvif_rx_action(struct xenvif_queue *queue)
 
 	while (xenvif_rx_ring_slots_available(queue)
 	       && (skb = xenvif_rx_dequeue(queue)) != NULL) {
-		queue->last_rx_time = jiffies;
 
-		XENVIF_RX_CB(skb)->meta_slots_used = xenvif_gop_skb(skb, &npo, queue);
-
+		xenvif_rx_build_gops(queue, &npo, skb);
 		__skb_queue_tail(&rxq, skb);
 	}
 
 	BUG_ON(npo.meta_prod > XEN_NETIF_RX_RING_SIZE);
 	if (!npo.copy_done && !npo.copy_prod)
-		goto done;
+		return;
 
 	BUG_ON(npo.copy_prod > MAX_GRANT_COPY_OPS);
 	if (npo.copy_prod)
@@ -845,79 +927,9 @@ static void xenvif_rx_action(struct xenvif_queue *queue)
 		BUG_ON(ret);
 	}
 
-	while ((skb = __skb_dequeue(&rxq)) != NULL) {
+	while ((skb = __skb_dequeue(&rxq)) != NULL)
+		need_to_notify |= xenvif_rx_submit(queue, &npo, skb);
 
-		if ((1 << queue->meta[npo.meta_cons].gso_type) &
-		    queue->vif->gso_prefix_mask) {
-			resp = RING_GET_RESPONSE(&queue->rx,
-						 queue->rx.rsp_prod_pvt++);
-
-			resp->flags = XEN_NETRXF_gso_prefix | XEN_NETRXF_more_data;
-
-			resp->offset = queue->meta[npo.meta_cons].gso_size;
-			resp->id = queue->meta[npo.meta_cons].id;
-			resp->status = XENVIF_RX_CB(skb)->meta_slots_used;
-
-			npo.meta_cons++;
-			XENVIF_RX_CB(skb)->meta_slots_used--;
-		}
-
-
-		queue->stats.tx_bytes += skb->len;
-		queue->stats.tx_packets++;
-
-		status = xenvif_check_gop(queue,
-					  XENVIF_RX_CB(skb)->meta_slots_used,
-					  &npo);
-
-		if (XENVIF_RX_CB(skb)->meta_slots_used == 1)
-			flags = 0;
-		else
-			flags = XEN_NETRXF_more_data;
-
-		if (skb->ip_summed == CHECKSUM_PARTIAL) /* local packet? */
-			flags |= XEN_NETRXF_csum_blank | XEN_NETRXF_data_validated;
-		else if (skb->ip_summed == CHECKSUM_UNNECESSARY)
-			/* remote but checksummed. */
-			flags |= XEN_NETRXF_data_validated;
-
-		offset = 0;
-		resp = make_rx_response(queue, queue->meta[npo.meta_cons].id,
-					status, offset,
-					queue->meta[npo.meta_cons].size,
-					flags);
-
-		if ((1 << queue->meta[npo.meta_cons].gso_type) &
-		    queue->vif->gso_mask) {
-			struct xen_netif_extra_info *gso =
-				(struct xen_netif_extra_info *)
-				RING_GET_RESPONSE(&queue->rx,
-						  queue->rx.rsp_prod_pvt++);
-
-			resp->flags |= XEN_NETRXF_extra_info;
-
-			gso->u.gso.type = queue->meta[npo.meta_cons].gso_type;
-			gso->u.gso.size = queue->meta[npo.meta_cons].gso_size;
-			gso->u.gso.pad = 0;
-			gso->u.gso.features = 0;
-
-			gso->type = XEN_NETIF_EXTRA_TYPE_GSO;
-			gso->flags = 0;
-		}
-
-		xenvif_add_frag_responses(queue, status,
-					  queue->meta + npo.meta_cons + 1,
-					  XENVIF_RX_CB(skb)->meta_slots_used);
-
-		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&queue->rx, ret);
-
-		need_to_notify |= !!ret;
-
-		npo.meta_cons += XENVIF_RX_CB(skb)->meta_slots_used;
-		dev_kfree_skb(skb);
-	}
-
-done:
 	if (need_to_notify)
 		notify_remote_via_irq(queue->rx_irq);
 }
