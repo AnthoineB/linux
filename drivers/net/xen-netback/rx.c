@@ -55,6 +55,90 @@ static void xenvif_update_needed_slots(struct xenvif_queue *queue,
 	WRITE_ONCE(queue->rx_slots_needed, needed);
 }
 
+static void xenvif_create_rx_map_op(struct xenvif_queue *queue,
+				    struct gnttab_map_grant_ref *mop,
+				    grant_ref_t ref,
+				    struct page *page)
+{
+	queue->rx_pages_to_map[mop - queue->rx_map_ops] = page;
+	gnttab_set_map_op(mop,
+			  (unsigned long)page_to_kaddr(page),
+			  GNTMAP_host_map,
+			  ref, queue->vif->domid);
+}
+
+static struct page *get_next_rx_page(struct xenvif_queue *queue,
+				     grant_ref_t gref)
+{
+	struct persistent_gnt_tree *tree = &queue->rx_gnts_tree;
+	struct persistent_gnt *gnt;
+	struct page *page = NULL;
+
+	gnt = get_persistent_gnt(tree, gref);
+	BUG_ON(IS_ERR(gnt));
+
+	if (likely(gnt)) {
+		page = gnt->page;
+		put_persistent_gnt(tree, gnt);
+		queue->rx_copy.copy_done++;
+		return page;
+	}
+
+	/* We couldn't find a match for the gref in the tree.
+	 * Map the page and add it to the tree. This page won't
+	 * be used for copying the packet but instead we will rely
+	 * grant copy. On the second time the gref is requested, the
+	 * persistent grant will be used instead.
+	 */
+	if (!get_free_page(tree, &page)) {
+		struct gnttab_map_grant_ref *mop;
+
+		mop = queue->rx_map_ops + queue->rx_copy.num_map++;
+		xenvif_create_rx_map_op(queue, mop, gref, page);
+	}
+
+	return NULL;
+}
+
+/* Called to check if the grant maps succeded, and also adding
+ * them to the grant tree. If some of the grants already exist in the tree
+ * it will unmap those.
+ */
+static void xenvif_check_mop(struct xenvif_queue *queue, int nr_mops)
+{
+	struct persistent_gnt_tree *tree = &queue->rx_gnts_tree;
+	struct persistent_gnt *persistent_gnt;
+	struct gnttab_map_grant_ref *op;
+	struct page *page;
+	int i;
+
+	for (i = 0; i < nr_mops; i++) {
+		op = queue->rx_map_ops + i;
+		page = virt_to_page(op->host_addr);
+
+		if (op->status != GNTST_okay) {
+			if (net_ratelimit())
+				netdev_err(queue->vif->dev,
+					   "Bad status %d from map to DOM%d.\n",
+					   op->status, queue->vif->domid);
+			put_free_pages(tree, &page, 1);
+			continue;
+		}
+
+		persistent_gnt = xenvif_pgrant_new(tree, op);
+		if (unlikely(!persistent_gnt)) {
+			netdev_err(queue->vif->dev,
+				   "Couldn't add gref to the tree! ref: %d",
+				   op->ref);
+			xenvif_page_unmap(queue, op->handle, &page);
+			put_free_pages(tree, &page, 1);
+			continue;
+		}
+
+		put_persistent_gnt(tree, persistent_gnt);
+	}
+}
+
 static bool xenvif_rx_ring_slots_available(struct xenvif_queue *queue)
 {
 	RING_IDX prod, cons;
@@ -161,7 +245,22 @@ static void xenvif_rx_copy_flush(struct xenvif_queue *queue)
 	unsigned int i;
 	int notify;
 
-	gnttab_batch_copy(queue->rx_copy.op, queue->rx_copy.num);
+	if (queue->rx_copy.num)
+		gnttab_batch_copy(queue->rx_copy.op, queue->rx_copy.num);
+
+	BUG_ON(queue->rx_copy.num_map > COPY_BATCH_SIZE);
+	if (queue->rx_copy.num_map) {
+		int ret = gnttab_map_refs(queue->rx_map_ops,
+					  NULL,
+					  queue->rx_pages_to_map,
+					  queue->rx_copy.num_map);
+		BUG_ON(ret);
+
+		xenvif_check_mop(queue,
+				 queue->rx_copy.num_map);
+
+		queue->rx_copy.num_map = 0;
+	}
 
 	for (i = 0; i < queue->rx_copy.num; i++) {
 		struct gnttab_copy *op;
@@ -198,12 +297,19 @@ static void xenvif_rx_copy_add(struct xenvif_queue *queue,
 	struct page *page;
 	struct xen_page_foreign *foreign;
 
+	page = virt_to_page(data);
+
+	if (likely(queue->rx_copy.copy_page)) {
+		memcpy(page_address(queue->rx_copy.copy_page) + xen_offset_in_page(data),
+		       page_to_kaddr(page) + offset, len);
+		return;
+	}
+
+	/* No persistent grant found, so we rely on grant copy */
 	if (queue->rx_copy.num == COPY_BATCH_SIZE)
 		xenvif_rx_copy_flush(queue);
 
 	op = &queue->rx_copy.op[queue->rx_copy.num];
-
-	page = virt_to_page(data);
 
 	op->flags = GNTCOPY_dest_gref;
 
@@ -256,6 +362,7 @@ static void xenvif_rx_next_skb(struct xenvif_queue *queue,
 	unsigned int gso_type;
 
 	skb = xenvif_rx_dequeue(queue);
+        BUG_ON(!skb);
 
 	queue->stats.tx_bytes += skb->len;
 	queue->stats.tx_packets++;
@@ -384,6 +491,9 @@ static void xenvif_rx_data_slot(struct xenvif_queue *queue,
 {
 	unsigned int offset = 0;
 	unsigned int flags;
+
+	if (queue->vif->persistent_grants)
+		queue->rx_copy.copy_page = get_next_rx_page(queue, req->gref);
 
 	do {
 		size_t len;

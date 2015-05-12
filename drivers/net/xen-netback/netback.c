@@ -269,11 +269,6 @@ static inline unsigned long idx_to_kaddr(struct xenvif_queue *queue,
 	return (unsigned long)pfn_to_kaddr(idx_to_pfn(queue, idx));
 }
 
-static inline void *page_to_kaddr(struct page *page)
-{
-	return pfn_to_kaddr(page_to_pfn(page));
-}
-
 #define callback_param(vif, pending_idx) \
 	(vif->pending_tx_info[pending_idx].callback_struct)
 
@@ -306,8 +301,8 @@ static inline pending_ring_idx_t pending_index(unsigned i)
 
 /*  Creates a new persistent grant and add it to the tree.
  */
-static struct persistent_gnt *xenvif_pgrant_new(struct persistent_gnt_tree *tree,
-						struct gnttab_map_grant_ref *gop)
+struct persistent_gnt *xenvif_pgrant_new(struct persistent_gnt_tree *tree,
+					 struct gnttab_map_grant_ref *gop)
 {
 	struct persistent_gnt *persistent_gnt;
 

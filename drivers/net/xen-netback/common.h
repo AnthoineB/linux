@@ -175,6 +175,9 @@ struct xenvif_copy_state {
 	RING_IDX idx[COPY_BATCH_SIZE];
 	unsigned int num;
 	struct sk_buff_head *completed;
+	unsigned int num_map;
+	unsigned int copy_done;
+	struct page *copy_page;
 };
 
 struct xenvif_queue { /* Per-queue data for xenvif */
@@ -258,6 +261,13 @@ struct xenvif_queue { /* Per-queue data for xenvif */
 	bool stalled;
 
 	struct xenvif_copy_state rx_copy;
+
+	/* To map the grefs to be added to the tree */
+	struct gnttab_map_grant_ref rx_map_ops[XEN_NETIF_RX_RING_SIZE];
+	struct page *rx_pages_to_map[XEN_NETIF_RX_RING_SIZE];
+	/* Only used if feature-persistent = 1 */
+	struct persistent_gnt_tree rx_gnts_tree;
+	struct page *rx_gnts_pages[XEN_NETIF_RX_RING_SIZE];
 
 	/* Transmit shaping: allow 'credit_bytes' every 'credit_usec'. */
 	unsigned long   credit_bytes;
@@ -433,6 +443,10 @@ void xenvif_carrier_on(struct xenvif *vif);
 /* Callback from stack when TX packet can be released */
 void xenvif_zerocopy_callback(struct ubuf_info *ubuf, bool zerocopy_success);
 
+/* Creates a new persistent grant and add it to the tree */
+struct persistent_gnt *xenvif_pgrant_new(struct persistent_gnt_tree *tree,
+					 struct gnttab_map_grant_ref *gop);
+
 /* Unmap a pending page and release it back to the guest */
 void xenvif_idx_unmap(struct xenvif_queue *queue, u16 pending_idx);
 void xenvif_page_unmap(struct xenvif_queue *queue,
@@ -493,6 +507,12 @@ int add_persistent_gnt(struct persistent_gnt_tree *tree,
 void put_persistent_gnt(struct persistent_gnt_tree *tree,
 			struct persistent_gnt *persistent_gnt);
 void free_persistent_gnts(struct persistent_gnt_tree *tree, unsigned int num);
+
+static inline void *page_to_kaddr(struct page *page)
+{
+	return pfn_to_kaddr(page_to_pfn(page));
+}
+
 /* Gets one page from the free pool in the tree */
 int get_free_page(struct persistent_gnt_tree *tree, struct page **page);
 /* Adds pages to the free pool in the tree */

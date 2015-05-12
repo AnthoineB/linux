@@ -651,10 +651,19 @@ int xenvif_init_queue(struct xenvif_queue *queue)
 					       XEN_NETIF_TX_RING_SIZE);
 		if (err)
 			goto err_disable;
+
+		err = init_persistent_gnt_tree(&queue->rx_gnts_tree,
+					       queue->rx_gnts_pages,
+					       XEN_NETIF_RX_RING_SIZE);
+		if (err)
+			goto err_free_tx;
 	}
 
 	return 0;
 
+err_free_tx:
+	gnttab_free_pages(XEN_NETIF_TX_RING_SIZE,
+			  queue->tx_gnts_pages);
 err_disable:
 	netdev_err(queue->vif->dev, "Could not reserve tree pages.");
 	queue->vif->persistent_grants = 0;
@@ -866,9 +875,12 @@ void xenvif_disconnect_data(struct xenvif *vif)
 
 		xenvif_unmap_frontend_data_rings(queue);
 
-		if (queue->vif->persistent_grants)
+		if (queue->vif->persistent_grants) {
 			deinit_persistent_gnt_tree(&queue->tx_gnts_tree,
 						   queue->tx_gnts_pages);
+			deinit_persistent_gnt_tree(&queue->rx_gnts_tree,
+						   queue->rx_gnts_pages);
+		}
 	}
 
 	xenvif_mcast_addr_list_free(vif);
