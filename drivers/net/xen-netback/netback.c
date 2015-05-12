@@ -867,17 +867,138 @@ void xenvif_kick_thread(struct xenvif_queue *queue)
 	wake_up(&queue->wq);
 }
 
-static void xenvif_rx_action(struct xenvif_queue *queue)
+static void xenvif_rx_build_gops(struct xenvif_queue *queue,
+				 struct netrx_pending_operations *npo,
+				 struct sk_buff *skb)
+{
+        queue->last_rx_time = jiffies;
+
+        XENVIF_RX_CB(skb)->meta_slots_used = xenvif_gop_skb(skb, &npo, queue);
+}
+
+static bool xenvif_rx_submit(struct xenvif_queue *queue,
+			     struct netrx_pending_operations *npo,
+			     struct sk_buff *skb)
 {
 	struct xenvif *vif = queue->vif;
 	s8 status;
 	u16 flags;
 	struct xen_netif_rx_response *resp;
-	struct sk_buff_head rxq;
-	struct sk_buff *skb;
 	LIST_HEAD(notify);
 	int ret;
 	unsigned long offset;
+	struct xen_netif_extra_info *extra = NULL;
+
+	if ((1 << queue->meta[npo->meta_cons].gso_type) &
+	    queue->vif->gso_prefix_mask) {
+		resp = RING_GET_RESPONSE(&queue->rx,
+					 queue->rx.rsp_prod_pvt++);
+
+		resp->flags = XEN_NETRXF_gso_prefix | XEN_NETRXF_more_data;
+
+		resp->offset = queue->meta[npo->meta_cons].gso_size;
+		resp->id = queue->meta[npo->meta_cons].id;
+		resp->status = XENVIF_RX_CB(skb)->meta_slots_used;
+
+		npo->meta_cons++;
+		XENVIF_RX_CB(skb)->meta_slots_used--;
+	}
+
+	queue->stats.tx_bytes += skb->len;
+	queue->stats.tx_packets++;
+
+	status = xenvif_check_gop(queue,
+				  XENVIF_RX_CB(skb)->meta_slots_used,
+				  npo);
+
+	if (XENVIF_RX_CB(skb)->meta_slots_used == 1)
+		flags = 0;
+	else
+		flags = XEN_NETRXF_more_data;
+
+	if (skb->ip_summed == CHECKSUM_PARTIAL) /* local packet? */
+		flags |= XEN_NETRXF_csum_blank | XEN_NETRXF_data_validated;
+	else if (skb->ip_summed == CHECKSUM_UNNECESSARY)
+		/* remote but checksummed. */
+		flags |= XEN_NETRXF_data_validated;
+
+	offset = 0;
+	resp = make_rx_response(queue, queue->meta[npo->meta_cons].id,
+				status, offset,
+				queue->meta[npo->meta_cons].size,
+				flags);
+
+	if ((1 << queue->meta[npo->meta_cons].gso_type) &
+	    queue->vif->gso_mask) {
+		extra = (struct xen_netif_extra_info *)
+			RING_GET_RESPONSE(&queue->rx,
+					  queue->rx.rsp_prod_pvt++);
+
+		resp->flags |= XEN_NETRXF_extra_info;
+
+		extra->u.gso.type = queue->meta[npo->meta_cons].gso_type;
+		extra->u.gso.size = queue->meta[npo->meta_cons].gso_size;
+		extra->u.gso.pad = 0;
+		extra->u.gso.features = 0;
+
+		extra->type = XEN_NETIF_EXTRA_TYPE_GSO;
+		extra->flags = 0;
+	}
+
+	if (skb->sw_hash) {
+		/* Since the skb got here via xenvif_select_queue()
+		 * we know that the hash has been re-calculated
+		 * according to a configuration set by the frontend
+		 * and therefore we know that it is legitimate to
+		 * pass it to the frontend.
+		 */
+		if (resp->flags & XEN_NETRXF_extra_info)
+			extra->flags |= XEN_NETIF_EXTRA_FLAG_MORE;
+		else
+			resp->flags |= XEN_NETRXF_extra_info;
+
+		extra = (struct xen_netif_extra_info *)
+			RING_GET_RESPONSE(&queue->rx,
+					  queue->rx.rsp_prod_pvt++);
+
+		extra->u.hash.algorithm =
+			XEN_NETIF_CTRL_HASH_ALGORITHM_TOEPLITZ;
+
+		if (skb->l4_hash)
+			extra->u.hash.type =
+				skb->protocol == htons(ETH_P_IP) ?
+				_XEN_NETIF_CTRL_HASH_TYPE_IPV4_TCP :
+				_XEN_NETIF_CTRL_HASH_TYPE_IPV6_TCP;
+		else
+			extra->u.hash.type =
+				skb->protocol == htons(ETH_P_IP) ?
+				_XEN_NETIF_CTRL_HASH_TYPE_IPV4 :
+				_XEN_NETIF_CTRL_HASH_TYPE_IPV6;
+
+		*(uint32_t *)extra->u.hash.value =
+			skb_get_hash_raw(skb);
+
+		extra->type = XEN_NETIF_EXTRA_TYPE_HASH;
+		extra->flags = 0;
+	}
+
+	xenvif_add_frag_responses(queue, status,
+				  queue->meta + npo->meta_cons + 1,
+				  XENVIF_RX_CB(skb)->meta_slots_used);
+
+	RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&queue->rx, ret);
+
+	npo->meta_cons += XENVIF_RX_CB(skb)->meta_slots_used;
+	dev_kfree_skb(skb);
+
+	return !!ret;
+}
+
+static void xenvif_rx_action(struct xenvif_queue *queue)
+{
+	int ret;
+	struct sk_buff *skb;
+	struct sk_buff_head rxq;
 	bool need_to_notify = false;
 
 	struct netrx_pending_operations npo = {
@@ -889,16 +1010,14 @@ static void xenvif_rx_action(struct xenvif_queue *queue)
 
 	while (xenvif_rx_ring_slots_available(queue)
 	       && (skb = xenvif_rx_dequeue(queue)) != NULL) {
-		queue->last_rx_time = jiffies;
 
-		XENVIF_RX_CB(skb)->meta_slots_used = xenvif_gop_skb(skb, &npo, queue);
-
+		xenvif_rx_build_gops(queue, &npo, skb);
 		__skb_queue_tail(&rxq, skb);
 	}
 
 	BUG_ON(npo.meta_prod > XEN_NETIF_RX_RING_SIZE);
 	if (!npo.copy_done && !npo.copy_prod)
-		goto done;
+		return;
 
 	BUG_ON(npo.copy_prod > MAX_GRANT_COPY_OPS);
 	if (npo.copy_prod)
@@ -913,116 +1032,9 @@ static void xenvif_rx_action(struct xenvif_queue *queue)
 		BUG_ON(ret);
 	}
 
-	while ((skb = __skb_dequeue(&rxq)) != NULL) {
-		struct xen_netif_extra_info *extra = NULL;
+	while ((skb = __skb_dequeue(&rxq)) != NULL)
+		need_to_notify |= xenvif_rx_submit(queue, &npo, skb);
 
-		if ((1 << queue->meta[npo.meta_cons].gso_type) &
-		    vif->gso_prefix_mask) {
-			resp = RING_GET_RESPONSE(&queue->rx,
-						 queue->rx.rsp_prod_pvt++);
-
-			resp->flags = XEN_NETRXF_gso_prefix | XEN_NETRXF_more_data;
-
-			resp->offset = queue->meta[npo.meta_cons].gso_size;
-			resp->id = queue->meta[npo.meta_cons].id;
-			resp->status = XENVIF_RX_CB(skb)->meta_slots_used;
-
-			npo.meta_cons++;
-			XENVIF_RX_CB(skb)->meta_slots_used--;
-		}
-
-
-		queue->stats.tx_bytes += skb->len;
-		queue->stats.tx_packets++;
-
-		status = xenvif_check_gop(queue,
-					  XENVIF_RX_CB(skb)->meta_slots_used,
-					  &npo);
-
-		if (XENVIF_RX_CB(skb)->meta_slots_used == 1)
-			flags = 0;
-		else
-			flags = XEN_NETRXF_more_data;
-
-		if (skb->ip_summed == CHECKSUM_PARTIAL) /* local packet? */
-			flags |= XEN_NETRXF_csum_blank | XEN_NETRXF_data_validated;
-		else if (skb->ip_summed == CHECKSUM_UNNECESSARY)
-			/* remote but checksummed. */
-			flags |= XEN_NETRXF_data_validated;
-
-		offset = 0;
-		resp = make_rx_response(queue, queue->meta[npo.meta_cons].id,
-					status, offset,
-					queue->meta[npo.meta_cons].size,
-					flags);
-
-		if ((1 << queue->meta[npo.meta_cons].gso_type) &
-		    vif->gso_mask) {
-			extra = (struct xen_netif_extra_info *)
-				RING_GET_RESPONSE(&queue->rx,
-						  queue->rx.rsp_prod_pvt++);
-
-			resp->flags |= XEN_NETRXF_extra_info;
-
-			extra->u.gso.type = queue->meta[npo.meta_cons].gso_type;
-			extra->u.gso.size = queue->meta[npo.meta_cons].gso_size;
-			extra->u.gso.pad = 0;
-			extra->u.gso.features = 0;
-
-			extra->type = XEN_NETIF_EXTRA_TYPE_GSO;
-			extra->flags = 0;
-		}
-
-		if (skb->sw_hash) {
-			/* Since the skb got here via xenvif_select_queue()
-			 * we know that the hash has been re-calculated
-			 * according to a configuration set by the frontend
-			 * and therefore we know that it is legitimate to
-			 * pass it to the frontend.
-			 */
-			if (resp->flags & XEN_NETRXF_extra_info)
-				extra->flags |= XEN_NETIF_EXTRA_FLAG_MORE;
-			else
-				resp->flags |= XEN_NETRXF_extra_info;
-
-			extra = (struct xen_netif_extra_info *)
-				RING_GET_RESPONSE(&queue->rx,
-						  queue->rx.rsp_prod_pvt++);
-
-			extra->u.hash.algorithm =
-				XEN_NETIF_CTRL_HASH_ALGORITHM_TOEPLITZ;
-
-			if (skb->l4_hash)
-				extra->u.hash.type =
-					skb->protocol == htons(ETH_P_IP) ?
-					_XEN_NETIF_CTRL_HASH_TYPE_IPV4_TCP :
-					_XEN_NETIF_CTRL_HASH_TYPE_IPV6_TCP;
-			else
-				extra->u.hash.type =
-					skb->protocol == htons(ETH_P_IP) ?
-					_XEN_NETIF_CTRL_HASH_TYPE_IPV4 :
-					_XEN_NETIF_CTRL_HASH_TYPE_IPV6;
-
-			*(uint32_t *)extra->u.hash.value =
-				skb_get_hash_raw(skb);
-
-			extra->type = XEN_NETIF_EXTRA_TYPE_HASH;
-			extra->flags = 0;
-		}
-
-		xenvif_add_frag_responses(queue, status,
-					  queue->meta + npo.meta_cons + 1,
-					  XENVIF_RX_CB(skb)->meta_slots_used);
-
-		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&queue->rx, ret);
-
-		need_to_notify |= !!ret;
-
-		npo.meta_cons += XENVIF_RX_CB(skb)->meta_slots_used;
-		dev_kfree_skb(skb);
-	}
-
-done:
 	if (need_to_notify)
 		notify_remote_via_irq(queue->rx_irq);
 }
