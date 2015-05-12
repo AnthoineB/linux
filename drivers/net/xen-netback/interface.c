@@ -176,6 +176,15 @@ static int xenvif_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	cb->expires = jiffies + vif->drain_timeout;
 
 	if (!queue->vif->persistent_grants) {
+#ifdef CONFIG_NET_PKTGEN
+		if (skb->xmit_more) {
+			struct sk_buff *nskb;
+
+			nskb = skb_clone(skb, GFP_ATOMIC | __GFP_NOWARN);
+			dev_kfree_skb(skb);
+			skb = nskb;
+		}
+#endif
 		xenvif_rx_queue_tail(queue, skb);
 		xenvif_kick_thread(queue);
 	} else if (xenvif_rx_map(queue, skb)) {
