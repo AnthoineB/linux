@@ -184,6 +184,9 @@ struct netfront_info {
 	/* Should skbs be bounced into a zeroed buffer? */
 	bool bounce;
 
+	/* Does backend support persistent grants? */
+	bool persistent_grants;
+
 	atomic_t rx_gso_checksum_fixup;
 };
 
@@ -2310,6 +2313,10 @@ static int talk_to_netback(struct xenbus_device *dev,
 	feature_split_evtchn = xenbus_read_unsigned(info->xbdev->otherend,
 					"feature-split-event-channels", 0);
 
+	/* Check if backend supports persistent grants */
+	info->persistent_grants = xenbus_read_unsigned(info->xbdev->otherend,
+					"feature-persistent", 0);
+
 	/* Read mac addr. */
 	err = xen_net_read_mac(dev, addr);
 	if (err) {
@@ -2421,6 +2428,12 @@ again:
 			   "1");
 	if (err) {
 		message = "writing feature-ipv6-csum-offload";
+		goto abort_transaction;
+	}
+
+	err = xenbus_write(xbt, dev->nodename, "feature-persistent", "1");
+	if (err) {
+		message = "writing feature-persistent";
 		goto abort_transaction;
 	}
 
