@@ -113,6 +113,151 @@ static struct xen_netif_rx_response *make_rx_response(struct xenvif_queue *queue
 					     u16      size,
 					     u16      flags);
 
+#define foreach_grant_safe(pos, n, rbtree, node) \
+	for ((pos) = container_of(rb_first((rbtree)), typeof(*(pos)), node), \
+	     (n) = (&(pos)->node) ? rb_next(&(pos)->node) : NULL; \
+	     &(pos)->node; \
+	     (pos) = container_of(n, typeof(*(pos)), node), \
+	     (n) = (&(pos)->node) ? rb_next(&(pos)->node) : NULL)
+
+int add_persistent_gnt(struct persistent_gnt_tree *tree,
+		       struct persistent_gnt *persistent_gnt)
+{
+	struct rb_node **new = NULL, *parent = NULL;
+	struct persistent_gnt *this;
+
+	if (tree->gnt_c >= tree->gnt_max) {
+		pr_err("Using maximum number of peristent grants\n");
+		tree->overflow = true;
+		return -EBUSY;
+	}
+	/* Figure out where to put new node */
+	new = &tree->root.rb_node;
+	while (*new) {
+		this = container_of(*new, struct persistent_gnt, node);
+
+		parent = *new;
+		if (persistent_gnt->gnt < this->gnt) {
+			new = &((*new)->rb_left);
+		} else if (persistent_gnt->gnt > this->gnt) {
+			new = &((*new)->rb_right);
+		} else {
+			pr_err("Trying to add a gref that's already in the tree\n");
+			return -EINVAL;
+		}
+	}
+
+	bitmap_zero(persistent_gnt->flags, PERSISTENT_GNT_FLAGS_SIZE);
+	set_bit(PERSISTENT_GNT_ACTIVE, persistent_gnt->flags);
+	/* Add new node and rebalance tree. */
+	rb_link_node(&persistent_gnt->node, parent, new);
+	rb_insert_color(&persistent_gnt->node, &tree->root);
+	tree->gnt_c++;
+	atomic_inc(&tree->gnt_in_use);
+	return 0;
+}
+
+struct persistent_gnt *get_persistent_gnt(struct persistent_gnt_tree *tree,
+					  grant_ref_t gref)
+{
+	struct persistent_gnt *data;
+	struct rb_node *node = NULL;
+
+	node = tree->root.rb_node;
+	while (node) {
+		data = container_of(node, struct persistent_gnt, node);
+
+		if (gref < data->gnt) {
+			node = node->rb_left;
+		} else if (gref > data->gnt) {
+			node = node->rb_right;
+		} else {
+			if (test_bit(PERSISTENT_GNT_ACTIVE, data->flags)) {
+				pr_err("Requesting a grant already in use\n");
+				return ERR_PTR(-EBUSY);
+			}
+			set_bit(PERSISTENT_GNT_ACTIVE, data->flags);
+			atomic_inc(&tree->gnt_in_use);
+			return data;
+		}
+	}
+	return NULL;
+}
+
+void put_persistent_gnt(struct persistent_gnt_tree *tree,
+			struct persistent_gnt *persistent_gnt)
+{
+	if (!test_bit(PERSISTENT_GNT_ACTIVE, persistent_gnt->flags))
+		pr_alert("Freeing a grant already unused\n");
+	set_bit(PERSISTENT_GNT_WAS_ACTIVE, persistent_gnt->flags);
+	clear_bit(PERSISTENT_GNT_ACTIVE, persistent_gnt->flags);
+	atomic_dec(&tree->gnt_in_use);
+}
+
+void free_persistent_gnts(struct persistent_gnt_tree *tree, unsigned int num)
+
+{
+	struct gnttab_unmap_grant_ref unmap[FATAL_SKB_SLOTS_DEFAULT];
+	struct page *pages[FATAL_SKB_SLOTS_DEFAULT];
+	struct persistent_gnt *persistent_gnt;
+	struct rb_root *root = &tree->root;
+	struct rb_node *n;
+	int ret = 0;
+	int pages_to_unmap = 0;
+	void *addr;
+
+	foreach_grant_safe(persistent_gnt, n, root, node) {
+		BUG_ON(persistent_gnt->handle ==
+			NETBACK_INVALID_HANDLE);
+
+		addr = pfn_to_kaddr(page_to_pfn(persistent_gnt->page));
+		gnttab_set_unmap_op(&unmap[pages_to_unmap],
+				    (unsigned long)addr,
+				    GNTMAP_host_map | GNTMAP_readonly,
+				    persistent_gnt->handle);
+
+		pages[pages_to_unmap] = persistent_gnt->page;
+
+		if (++pages_to_unmap == FATAL_SKB_SLOTS_DEFAULT ||
+		    !rb_next(&persistent_gnt->node)) {
+			ret = gnttab_unmap_refs(unmap, NULL, pages,
+						pages_to_unmap);
+			BUG_ON(ret);
+			put_free_pages(tree, pages, pages_to_unmap);
+			pages_to_unmap = 0;
+		}
+
+		rb_erase(&persistent_gnt->node, root);
+		kfree(persistent_gnt);
+		num--;
+	}
+	BUG_ON(num != 0);
+}
+
+int get_free_page(struct persistent_gnt_tree *tree,
+		  struct page **page)
+{
+	if (list_empty(&tree->free_pages)) {
+		BUG_ON(tree->free_pages_num != 0);
+		return 1;
+	}
+	BUG_ON(tree->free_pages_num == 0);
+	page[0] = list_first_entry(&tree->free_pages, struct page, lru);
+	list_del(&page[0]->lru);
+	tree->free_pages_num--;
+	return 0;
+}
+
+void put_free_pages(struct persistent_gnt_tree *tree,
+		    struct page **page, int num)
+{
+	int i;
+
+	for (i = 0; i < num; i++)
+		list_add(&page[i]->lru, &tree->free_pages);
+	tree->free_pages_num += num;
+}
+
 static inline unsigned long idx_to_pfn(struct xenvif_queue *queue,
 				       u16 idx)
 {
