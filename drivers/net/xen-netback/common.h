@@ -235,6 +235,13 @@ struct xenvif_queue { /* Per-queue data for xenvif */
 
 	struct gnttab_copy grant_copy_op[MAX_GRANT_COPY_OPS];
 
+	/* To map the grefs to be added to the tree */
+	struct gnttab_map_grant_ref rx_map_ops[XEN_NETIF_RX_RING_SIZE];
+	struct page *rx_pages_to_map[XEN_NETIF_RX_RING_SIZE];
+	/* Only used if feature-persistent = 1 */
+	struct persistent_gnt_tree rx_gnts_tree;
+	struct page *rx_gnts_pages[XEN_NETIF_RX_RING_SIZE];
+
 	/* We create one meta structure per ring request we consume, so
 	 * the maximum number is the same as the ring size.
 	 */
