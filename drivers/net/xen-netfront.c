@@ -422,6 +422,7 @@ static void xennet_tx_buf_gc(struct netfront_queue *queue)
 	unsigned short id;
 	struct sk_buff *skb;
 	bool more_to_do;
+	unsigned use_persistent_gnts = queue->info->feature_persistent;
 
 	BUG_ON(!netif_carrier_ok(queue->info->netdev));
 
@@ -439,13 +440,16 @@ static void xennet_tx_buf_gc(struct netfront_queue *queue)
 			id  = txrsp->id;
 			skb = queue->tx_skbs[id].skb;
 
-			release_grant(queue->grant_tx[id].ref,
-				      &queue->gref_tx_head,
-				      queue->info->xbdev->otherend_id,
-				      GNTMAP_readonly);
+			if (!use_persistent_gnts) {
+				release_grant(queue->grant_tx[id].ref,
+					      &queue->gref_tx_head,
+					      queue->info->xbdev->otherend_id,
+					      GNTMAP_readonly);
 
-			queue->grant_tx[id].ref = GRANT_INVALID_REF;
-			queue->grant_tx[id].page = NULL;
+				queue->grant_tx[id].ref = GRANT_INVALID_REF;
+				queue->grant_tx[id].page = NULL;
+			}
+
 			add_id_to_freelist(&queue->tx_skb_freelist, queue->tx_skbs, id);
 			dev_kfree_skb_irq(skb);
 		}
@@ -472,7 +476,7 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 	struct xennet_gnttab_make_txreq *info = data;
 	unsigned int id;
 	struct xen_netif_tx_request *tx;
-	grant_ref_t ref;
+	struct grant *gnt;
 	/* convenient aliases */
 	struct page *page = info->page;
 	struct netfront_queue *queue = info->queue;
@@ -480,17 +484,25 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 
 	id = get_id_from_freelist(&queue->tx_skb_freelist, queue->tx_skbs);
 	tx = RING_GET_REQUEST(&queue->tx, queue->tx.req_prod_pvt++);
-	ref = claim_grant(gfn,
-			  &queue->gref_tx_head,
-			  queue->info->xbdev->otherend_id,
-			  GNTMAP_readonly);
+	gnt = &queue->grant_tx[id];
+
+	if (queue->info->feature_persistent)
+		memcpy(pfn_to_kaddr(page_to_pfn(gnt->page)) + offset,
+		       pfn_to_kaddr(page_to_pfn(page)) + offset,
+		       len);
+	else
+		gnt->page = page;
+
+	if (gnt->ref == GRANT_INVALID_REF)
+		gnt->ref = claim_grant(gfn,
+				       &queue->gref_tx_head,
+				       queue->info->xbdev->otherend_id,
+				       GNTMAP_readonly);
 
 	queue->tx_skbs[id].skb = skb;
-	queue->grant_tx[id].page = page;
-	queue->grant_tx[id].ref = ref;
 
 	tx->id = id;
-	tx->gref = ref;
+	tx->gref = gnt->ref;
 	tx->offset = offset;
 	tx->size = len;
 	tx->flags = 0;
@@ -1655,7 +1667,10 @@ static int xennet_init_queue(struct netfront_queue *queue)
 	for (i = 0; i < NET_TX_RING_SIZE; i++) {
 		skb_entry_set_link(&queue->tx_skbs[i], i+1);
 		queue->grant_tx[i].ref = GRANT_INVALID_REF;
-		queue->grant_tx[i].page = NULL;
+		if (queue->info->feature_persistent)
+			queue->grant_tx[i].page = alloc_page(GFP_NOIO);
+		else
+			queue->grant_tx[i].page = NULL;
 	}
 
 	/* Clear out rx_skbs */
