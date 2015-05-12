@@ -267,6 +267,15 @@ static int xenvif_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (vif->hash.alg == XEN_NETIF_CTRL_HASH_ALGORITHM_NONE)
 		skb_clear_hash(skb);
 
+#ifdef CONFIG_NET_PKTGEN
+	if (skb->xmit_more) {
+		struct sk_buff *nskb;
+
+		nskb = skb_clone(skb, GFP_ATOMIC | __GFP_NOWARN);
+		dev_kfree_skb(skb);
+		skb = nskb;
+	}
+#endif
 	if (!xenvif_rx_queue_tail(queue, skb))
 		goto drop;
 
