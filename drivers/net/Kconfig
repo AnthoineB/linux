@@ -593,6 +593,7 @@ config XEN_NETDEV_FRONTEND
 config XEN_NETDEV_BACKEND
 	tristate "Xen backend network device"
 	depends on XEN_BACKEND
+	select PAGE_POOL
 	help
 	  This driver allows the kernel to act as a Xen network driver
 	  domain which exports paravirtual network devices to other
@@ -611,6 +612,11 @@ config XEN_NETDEV_BACKEND
 	  domain (often this is domain 0) you should say Y here. To
 	  compile this driver as a module, chose M here: the module
 	  will be called xen-netback.
+
+config XEN_NETBACK_COPY
+	bool "Copy requests to page pool-backed skbs"
+	depends on XEN_NETDEV_BACKEND
+	default n
 
 config VMXNET3
 	tristate "VMware VMXNET3 ethernet driver"

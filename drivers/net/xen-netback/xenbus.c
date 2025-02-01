@@ -52,10 +52,12 @@ static int xenvif_read_io_ring(struct seq_file *m, void *v)
 			   queue->pending_prod,
 			   queue->pending_cons,
 			   nr_pending_reqs(queue));
+#ifndef CONFIG_XEN_NETBACK_COPY
 		seq_printf(m, "dealloc prod %u dealloc cons %u dealloc_queue %u\n\n",
 			   queue->dealloc_prod,
 			   queue->dealloc_cons,
 			   queue->dealloc_prod - queue->dealloc_cons);
+#endif
 	}
 
 	if (rx_ring->sring) {

@@ -44,6 +44,7 @@
 /* Number of bytes allowed on the internal guest Rx queue. */
 #define XENVIF_RX_QUEUE_BYTES (XEN_NETIF_RX_RING_SIZE/2 * PAGE_SIZE)
 
+#ifndef CONFIG_XEN_NETBACK_COPY
 /* This function is used to set SKBFL_ZEROCOPY_ENABLE as well as
  * increasing the inflight counter. We need to increase the inflight
  * counter because core driver calls into xenvif_zerocopy_callback
@@ -66,6 +67,7 @@ void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue)
 	 */
 	wake_up(&queue->dealloc_wq);
 }
+#endif
 
 static int xenvif_schedulable(struct xenvif *vif)
 {
@@ -231,9 +233,12 @@ xenvif_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	/* Drop the packet if queue is not ready */
 	if (queue->task == NULL ||
-	    queue->dealloc_task == NULL ||
 	    !xenvif_schedulable(vif))
 		goto drop;
+#ifndef CONFIG_XEN_NETBACK_COPY
+	if (queue->dealloc_task == NULL)
+		goto drop;
+#endif
 
 	if (vif->multicast_control && skb->pkt_type == PACKET_MULTICAST) {
 		struct ethhdr *eth = (struct ethhdr *)skb->data;
@@ -561,6 +566,16 @@ struct xenvif *xenvif_alloc(struct device *parent, domid_t domid,
 int xenvif_init_queue(struct xenvif_queue *queue)
 {
 	int err, i;
+#ifdef CONFIG_XEN_NETBACK_COPY
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.flags = 0,
+		.pool_size = XEN_NETIF_TX_RING_SIZE,
+		.nid = NUMA_NO_NODE,
+		.dev = &queue->vif->dev->dev,
+		.napi = &queue->napi,
+	};
+#endif
 
 	queue->credit_bytes = queue->remaining_credit = ~0UL;
 	queue->credit_usec  = 0UL;
@@ -580,6 +595,15 @@ int xenvif_init_queue(struct xenvif_queue *queue)
 	spin_lock_init(&queue->callback_lock);
 	spin_lock_init(&queue->response_lock);
 
+#ifdef CONFIG_XEN_NETBACK_COPY
+	queue->tx_page_pool = page_pool_create(&pp_params);
+	if (IS_ERR(queue->tx_page_pool)) {
+		err = PTR_ERR(queue->tx_page_pool);
+		queue->tx_page_pool = NULL;
+		return err;
+	}
+#endif
+
 	/* If ballooning is disabled, this will consume real memory, so you
 	 * better enable it. The long term solution would be to use just a
 	 * bunch of valid page descriptors, without dependency on ballooning
@@ -588,9 +612,11 @@ int xenvif_init_queue(struct xenvif_queue *queue)
 				 queue->mmap_pages);
 	if (err) {
 		netdev_err(queue->vif->dev, "Could not reserve mmap_pages\n");
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto err_free_pp;
 	}
 
+#ifndef CONFIG_XEN_NETBACK_COPY
 	for (i = 0; i < MAX_PENDING_REQS; i++) {
 		queue->pending_tx_info[i].callback_struct = (struct ubuf_info_msgzc)
 			{ { .ops = &xenvif_ubuf_ops },
@@ -598,8 +624,16 @@ int xenvif_init_queue(struct xenvif_queue *queue)
 			      .desc = i } } };
 		queue->grant_tx_handle[i] = NETBACK_INVALID_HANDLE;
 	}
+#endif
 
 	return 0;
+
+err_free_pp:
+#ifdef CONFIG_XEN_NETBACK_COPY
+	page_pool_destroy(queue->tx_page_pool);
+	queue->tx_page_pool = NULL;
+#endif
+	return err;
 }
 
 void xenvif_carrier_on(struct xenvif *vif)
@@ -675,10 +709,12 @@ static void xenvif_disconnect_queue(struct xenvif_queue *queue)
 		queue->task = NULL;
 	}
 
+#ifndef CONFIG_XEN_NETBACK_COPY
 	if (queue->dealloc_task) {
 		kthread_stop(queue->dealloc_task);
 		queue->dealloc_task = NULL;
 	}
+#endif
 
 	if (queue->napi.poll) {
 		netif_napi_del(&queue->napi);
@@ -712,7 +748,9 @@ int xenvif_connect_data(struct xenvif_queue *queue,
 
 	BUG_ON(queue->tx_irq);
 	BUG_ON(queue->task);
+#ifndef CONFIG_XEN_NETBACK_COPY
 	BUG_ON(queue->dealloc_task);
+#endif
 
 	err = xenvif_map_frontend_data_rings(queue, tx_ring_ref,
 					     rx_ring_ref);
@@ -720,8 +758,10 @@ int xenvif_connect_data(struct xenvif_queue *queue,
 		goto err;
 
 	init_waitqueue_head(&queue->wq);
+#ifndef CONFIG_XEN_NETBACK_COPY
 	init_waitqueue_head(&queue->dealloc_wq);
 	atomic_set(&queue->inflight_packets, 0);
+#endif
 
 	netif_napi_add(queue->vif->dev, &queue->napi, xenvif_poll);
 
@@ -738,11 +778,13 @@ int xenvif_connect_data(struct xenvif_queue *queue,
 	 */
 	get_task_struct(task);
 
+#ifndef CONFIG_XEN_NETBACK_COPY
 	task = kthread_run(xenvif_dealloc_kthread, queue,
 			   "%s-dealloc", queue->name);
 	if (IS_ERR(task))
 		goto kthread_err;
 	queue->dealloc_task = task;
+#endif
 
 	if (tx_evtchn == rx_evtchn) {
 		/* feature-split-event-channels == 0 */
@@ -838,6 +880,9 @@ void xenvif_disconnect_ctrl(struct xenvif *vif)
 void xenvif_deinit_queue(struct xenvif_queue *queue)
 {
 	gnttab_free_pages(MAX_PENDING_REQS, queue->mmap_pages);
+#ifdef CONFIG_XEN_NETBACK_COPY
+	page_pool_destroy(queue->tx_page_pool);
+#endif
 }
 
 void xenvif_free(struct xenvif *vif)

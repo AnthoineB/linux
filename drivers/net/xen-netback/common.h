@@ -39,6 +39,7 @@
 #include <linux/etherdevice.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
+#include <net/page_pool/types.h>
 
 #include <xen/interface/io/netif.h>
 #include <xen/interface/grant_table.h>
@@ -180,12 +181,17 @@ struct xenvif_queue { /* Per-queue data for xenvif */
 	 * it only protect response creation
 	 */
 	spinlock_t response_lock;
+
+#ifdef CONFIG_XEN_NETBACK_COPY
+	struct page_pool *tx_page_pool;
+#else
 	pending_ring_idx_t dealloc_prod;
 	pending_ring_idx_t dealloc_cons;
 	u16 dealloc_ring[MAX_PENDING_REQS];
 	struct task_struct *dealloc_task;
 	wait_queue_head_t dealloc_wq;
 	atomic_t inflight_packets;
+#endif
 
 	/* Use kthread for guest RX */
 	struct task_struct *task;
@@ -390,8 +396,10 @@ bool xenvif_rx_queue_tail(struct xenvif_queue *queue, struct sk_buff *skb);
 
 void xenvif_carrier_on(struct xenvif *vif);
 
+#ifndef CONFIG_XEN_NETBACK_COPY
 /* Callbacks from stack when TX packet can be released */
 extern const struct ubuf_info_ops xenvif_ubuf_ops;
+#endif
 
 static inline pending_ring_idx_t nr_pending_reqs(struct xenvif_queue *queue)
 {
@@ -413,9 +421,11 @@ extern unsigned int xenvif_hash_cache_size;
 extern struct dentry *xen_netback_dbg_root;
 #endif
 
+#ifndef CONFIG_XEN_NETBACK_COPY
 void xenvif_skb_zerocopy_prepare(struct xenvif_queue *queue,
 				 struct sk_buff *skb);
 void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue);
+#endif
 
 /* Multicast control */
 bool xenvif_mcast_match(struct xenvif *vif, const u8 *addr);
