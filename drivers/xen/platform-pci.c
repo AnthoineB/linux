@@ -40,10 +40,11 @@
 #define DRV_NAME    "xen-platform-pci"
 
 static unsigned long platform_mmio;
-static unsigned long platform_mmio_alloc;
+/*static unsigned long platform_mmio_alloc;*/
 static unsigned long platform_mmiolen;
 static uint64_t callback_via;
 
+#if 0
 static unsigned long alloc_xen_mmio(unsigned long len)
 {
 	unsigned long addr;
@@ -54,6 +55,7 @@ static unsigned long alloc_xen_mmio(unsigned long len)
 
 	return addr;
 }
+#endif
 
 static uint64_t get_callback_via(struct pci_dev *pdev)
 {
@@ -108,8 +110,10 @@ static int platform_pci_probe(struct pci_dev *pdev,
 	int i, ret;
 	long ioaddr;
 	long mmio_addr, mmio_len;
+#if 0
 	unsigned int max_nr_gframes;
 	unsigned long grant_frames;
+#endif
 
 	if (!xen_domain())
 		return -ENODEV;
@@ -154,6 +158,7 @@ static int platform_pci_probe(struct pci_dev *pdev,
 		}
 	}
 
+#if 0
 	max_nr_gframes = gnttab_max_grant_frames();
 	grant_frames = alloc_xen_mmio(PAGE_SIZE * max_nr_gframes);
 	ret = gnttab_setup_auto_xlat_frames(grant_frames);
@@ -162,10 +167,13 @@ static int platform_pci_probe(struct pci_dev *pdev,
 	ret = gnttab_init();
 	if (ret)
 		goto grant_out;
+#endif
 	xenbus_probe(NULL);
 	return 0;
+#if 0
 grant_out:
 	gnttab_free_auto_xlat_frames();
+#endif
 out:
 	pci_release_region(pdev, 0);
 mem_out:

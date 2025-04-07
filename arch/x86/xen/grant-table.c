@@ -160,12 +160,12 @@ err:
 	return -ENOMEM;
 }
 
-#ifdef CONFIG_XEN_PVH
+#ifdef CONFIG_XEN
 #include <xen/events.h>
 #include <xen/xen-ops.h>
 static int __init xen_pvh_gnttab_setup(void)
 {
-	if (!xen_pvh_domain())
+	if (!xen_hvm_domain())
 		return -ENODEV;
 
 	xen_auto_xlat_grant_frames.count = gnttab_max_grant_frames();

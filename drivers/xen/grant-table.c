@@ -1486,9 +1486,11 @@ static int __gnttab_init(void)
 	if (!xen_domain())
 		return -ENODEV;
 
+#if 0
 	/* Delay grant-table initialization in the PV on HVM case */
 	if (xen_hvm_domain() && !xen_pvh_domain())
 		return 0;
+#endif
 
 	return gnttab_init();
 }
