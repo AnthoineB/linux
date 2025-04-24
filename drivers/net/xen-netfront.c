@@ -361,17 +361,16 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 		BUG_ON(queue->rx_skbs[id]);
 		queue->rx_skbs[id] = skb;
 
-		ref = gnttab_claim_grant_reference(&queue->gref_rx_head);
-		WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
+		page = skb_frag_page(&skb_shinfo(skb)->frags[0]);
+		ref = claim_grant(xen_page_to_gfn(page),
+				  &queue->gref_rx_head,
+				  queue->info->xbdev->otherend_id,
+				  0);
+
 		queue->grant_rx[id].ref = ref;
 
-		page = skb_frag_page(&skb_shinfo(skb)->frags[0]);
-
 		req = RING_GET_REQUEST(&queue->rx, req_prod);
-		gnttab_page_grant_foreign_access_ref_one(ref,
-							 queue->info->xbdev->otherend_id,
-							 page,
-							 0);
+
 		req->id = id;
 		req->gref = ref;
 	}
@@ -1119,15 +1118,11 @@ static int xennet_get_responses(struct netfront_queue *queue,
 			goto next;
 		}
 
-		if (!gnttab_end_foreign_access_ref(ref)) {
-			dev_alert(dev,
-				  "Grant still in use by backend domain\n");
+		if (release_grant(dev, ref, &queue->gref_rx_head)) {
 			queue->info->broken = true;
 			dev_alert(dev, "Disabled for further use\n");
 			return -EINVAL;
 		}
-
-		gnttab_release_grant_reference(&queue->gref_rx_head, ref);
 
 		rcu_read_lock();
 		xdp_prog = rcu_dereference(queue->xdp_prog);
