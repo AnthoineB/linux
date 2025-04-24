@@ -152,7 +152,7 @@ struct netfront_queue {
 
 	struct sk_buff *rx_skbs[NET_RX_RING_SIZE];
 	grant_ref_t gref_rx_head;
-	grant_ref_t grant_rx_ref[NET_RX_RING_SIZE];
+	struct grant grant_rx[NET_RX_RING_SIZE];
 
 	unsigned int rx_rsp_unconsumed;
 	spinlock_t rx_cons_lock;
@@ -235,8 +235,8 @@ static grant_ref_t xennet_get_rx_ref(struct netfront_queue *queue,
 					    RING_IDX ri)
 {
 	int i = xennet_rxidx(ri);
-	grant_ref_t ref = queue->grant_rx_ref[i];
-	queue->grant_rx_ref[i] = INVALID_GRANT_REF;
+	grant_ref_t ref = queue->grant_rx[i].ref;
+	queue->grant_rx[i].ref = INVALID_GRANT_REF;
 	return ref;
 }
 
@@ -363,7 +363,7 @@ static void xennet_alloc_rx_buffers(struct netfront_queue *queue)
 
 		ref = gnttab_claim_grant_reference(&queue->gref_rx_head);
 		WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
-		queue->grant_rx_ref[id] = ref;
+		queue->grant_rx[id].ref = ref;
 
 		page = skb_frag_page(&skb_shinfo(skb)->frags[0]);
 
@@ -969,7 +969,7 @@ static void xennet_move_rx_slot(struct netfront_queue *queue, struct sk_buff *sk
 
 	BUG_ON(queue->rx_skbs[new]);
 	queue->rx_skbs[new] = skb;
-	queue->grant_rx_ref[new] = ref;
+	queue->grant_rx[new].ref = ref;
 	RING_GET_REQUEST(&queue->rx, queue->rx.req_prod_pvt)->id = new;
 	RING_GET_REQUEST(&queue->rx, queue->rx.req_prod_pvt)->gref = ref;
 	queue->rx.req_prod_pvt++;
@@ -1503,7 +1503,7 @@ static void xennet_release_rx_bufs(struct netfront_queue *queue)
 		if (!skb)
 			continue;
 
-		ref = queue->grant_rx_ref[id];
+		ref = queue->grant_rx[id].ref;
 		if (ref == INVALID_GRANT_REF)
 			continue;
 
@@ -1514,7 +1514,7 @@ static void xennet_release_rx_bufs(struct netfront_queue *queue)
 		 */
 		get_page(page);
 		gnttab_end_foreign_access(ref, page);
-		queue->grant_rx_ref[id] = INVALID_GRANT_REF;
+		queue->grant_rx[id].ref = INVALID_GRANT_REF;
 
 		kfree_skb(skb);
 	}
@@ -2100,7 +2100,8 @@ static int xennet_init_queue(struct netfront_queue *queue)
 	/* Clear out rx_skbs */
 	for (i = 0; i < NET_RX_RING_SIZE; i++) {
 		queue->rx_skbs[i] = NULL;
-		queue->grant_rx_ref[i] = INVALID_GRANT_REF;
+		queue->grant_rx[i].ref = INVALID_GRANT_REF;
+		queue->grant_rx[i].page = NULL;
 	}
 
 	/* A grant for every tx ring slot */
