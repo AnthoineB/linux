@@ -488,7 +488,7 @@ void xenvif_dump_hash_info(struct xenvif *vif, struct seq_file *m);
 
 /* tree ops for persistent grants */
 struct persistent_gnt *get_persistent_gnt(struct persistent_gnt_tree *tree,
-					  grant_ref_t gref);
+					  grant_ref_t gref, u16 pending_idx);
 int add_persistent_gnt(struct persistent_gnt_tree *tree,
 		       struct persistent_gnt *persistent_gnt);
 void put_persistent_gnt(struct persistent_gnt_tree *tree,
