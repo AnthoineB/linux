@@ -270,6 +270,36 @@ static void xennet_maybe_wake_tx(struct netfront_queue *queue)
 		netif_tx_wake_queue(netdev_get_tx_queue(dev, queue->id));
 }
 
+static grant_ref_t claim_grant(unsigned long gfn,
+			       grant_ref_t *gref_head,
+			       int otherend_id,
+			       int flags)
+{
+	grant_ref_t ref;
+
+	ref = gnttab_claim_grant_reference(gref_head);
+	WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
+
+	gnttab_grant_foreign_access_ref(ref, otherend_id,
+					gfn, flags);
+
+	return ref;
+}
+
+static int release_grant(const struct device *dev,
+			 grant_ref_t ref,
+			 grant_ref_t *gref_head)
+{
+	if (unlikely(!gnttab_end_foreign_access_ref(ref))) {
+		dev_alert(dev,
+			  "Grant still in use by backend domain\n");
+		return 1;
+	}
+
+	gnttab_release_grant_reference(gref_head, ref);
+
+	return 0;
+}
 
 static struct sk_buff *xennet_alloc_one_rx_buffer(struct netfront_queue *queue)
 {
@@ -435,14 +465,12 @@ static bool xennet_tx_buf_gc(struct netfront_queue *queue)
 			queue->tx_link[id] = TX_LINK_NONE;
 			skb = queue->tx_skbs[id];
 			queue->tx_skbs[id] = NULL;
-			if (unlikely(!gnttab_end_foreign_access_ref(
-				queue->grant_tx[id].ref))) {
-				dev_alert(dev,
-					  "Grant still in use by backend domain\n");
+
+			if (release_grant(dev, queue->grant_tx[id].ref,
+					  &queue->gref_tx_head)) {
 				goto err;
 			}
-			gnttab_release_grant_reference(
-				&queue->gref_tx_head, queue->grant_tx[id].ref);
+
 			queue->grant_tx[id].ref = INVALID_GRANT_REF;
 			queue->grant_tx[id].page = NULL;
 			add_id_to_list(&queue->tx_skb_freelist, queue->tx_link, id);
@@ -488,11 +516,11 @@ static void xennet_tx_setup_grant(unsigned long gfn, unsigned int offset,
 
 	id = get_id_from_list(&queue->tx_skb_freelist, queue->tx_link);
 	tx = RING_GET_REQUEST(&queue->tx, queue->tx.req_prod_pvt++);
-	ref = gnttab_claim_grant_reference(&queue->gref_tx_head);
-	WARN_ON_ONCE(IS_ERR_VALUE((unsigned long)(int)ref));
 
-	gnttab_grant_foreign_access_ref(ref, queue->info->xbdev->otherend_id,
-					gfn, GNTMAP_readonly);
+	ref = claim_grant(gfn,
+			  &queue->gref_tx_head,
+			  queue->info->xbdev->otherend_id,
+			  GNTMAP_readonly);
 
 	queue->tx_skbs[id] = skb;
 	queue->grant_tx[id].page = page;
