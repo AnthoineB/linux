@@ -1856,6 +1856,10 @@ static void make_tx_response(struct xenvif_queue *queue,
 	RING_IDX i = queue->tx.rsp_prod_pvt;
 	struct xen_netif_tx_response *resp;
 
+	if (txp->id >= RING_SIZE(&queue->tx)) {
+		netdev_err(queue->vif->dev, "Make tx response: incorrect id %u\n", txp->id);
+		BUG();
+	}
 	resp = RING_GET_RESPONSE(&queue->tx, i);
 	resp->id     = txp->id;
 	resp->status = st;
