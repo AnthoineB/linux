@@ -542,7 +542,6 @@ static inline void xenvif_pgrant_reset(struct xenvif_queue *queue,
 static inline void xenvif_tx_create_map_op(struct xenvif_queue *queue,
 					   u16 pending_idx,
 					   struct xen_netif_tx_request *txp,
-					   unsigned int extra_count,
 					   struct gnttab_map_grant_ref *mop,
 					   bool use_persistent_gnts)
 {
@@ -652,6 +651,7 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 
 		index = pending_index(queue->pending_cons);
 		pending_idx = queue->pending_ring[index];
+		callback_param(queue, pending_idx).ctx = NULL;
 		map_pgrant = false;
 
 		if (use_persistent_gnts) {
@@ -690,23 +690,28 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 		cop->len = amount;
 		cop->flags = GNTCOPY_source_gref;
 
-		callback_param(queue, pending_idx).ctx = NULL;
 		copy_pending_idx(skb, copy_count(skb)) = pending_idx;
 		if (!split)
 			copy_count(skb)++;
 
 		cop++;
+skip_gop:
 		data_len -= amount;
 
-skip_gop:
 		if (amount == txp->size) {
 			/* The copy op covered the full tx_request */
 
 			need_map = use_persistent_gnts && map_pgrant;
 			XENVIF_TX_CB(skb)->pending_map = need_map;
 
+			memcpy(&queue->pending_tx_info[pending_idx].req,
+			       txp, sizeof(*txp));
 			queue->pending_tx_info[pending_idx].extra_count =
 				(txp == first) ? extra_count : 0;
+
+			if (need_map)
+				xenvif_tx_create_map_op(queue, pending_idx, txp,
+							gop++, map_pgrant);
 
 			if (txp == first)
 				txp = txfrags;
@@ -723,14 +728,6 @@ skip_gop:
 			txp->size -= amount;
 		}
 
-		if (need_map)
-			xenvif_tx_create_map_op(queue,
-						pending_idx,
-						txp, extra_count, gop++,
-						map_pgrant);
-
-		memcpy(&queue->pending_tx_info[pending_idx].req,
-			       txp, sizeof(*txp));
 	}
 
 	map_pgrant = false;
@@ -752,10 +749,11 @@ skip_gop:
 		frag_set_pending_idx(&frags[shinfo->nr_frags], pending_idx);
 		memcpy(&queue->pending_tx_info[pending_idx].req, txp,
 		       sizeof(*txp));
+		queue->pending_tx_info[pending_idx].extra_count = txp == first ? extra_count : 0;
 		if (!xenvif_tx_pgrant_available(queue, txp->gref, pending_idx,
 						&map_pgrant))
 			xenvif_tx_create_map_op(queue, pending_idx, txp,
-						txp == first ? extra_count : 0, gop,
+						gop,
 						map_pgrant);
 		++shinfo->nr_frags;
 		++gop;
@@ -791,10 +789,11 @@ skip_gop:
 					     pending_idx);
 			memcpy(&queue->pending_tx_info[pending_idx].req, txp,
 			       sizeof(*txp));
+			queue->pending_tx_info[pending_idx].extra_count = 0;
 			if (!xenvif_tx_pgrant_available(queue, txp->gref, pending_idx,
 							&map_pgrant))
 				xenvif_tx_create_map_op(queue, pending_idx, txp,
-							txp == first ? extra_count : 0, gop,
+							gop,
 							map_pgrant);
 			++shinfo->nr_frags;
 			++gop;
@@ -1678,6 +1677,7 @@ void xenvif_zerocopy_callback(struct ubuf_info *ubuf, bool zerocopy_success)
 	unsigned long flags;
 	pending_ring_idx_t index, dealloc_prod_save;
 	struct xenvif_queue *queue = ubuf_to_queue(ubuf);
+	bool wakeup = true;
 
 	/* This is the only place where we grab this lock, to protect callbacks
 	 * from each other.
@@ -1708,8 +1708,8 @@ void xenvif_zerocopy_callback(struct ubuf_info *ubuf, bool zerocopy_success)
 	} while (ubuf);
 
 	/* Wake up only when there are grants to unmap */
-	if (dealloc_prod_save != queue->dealloc_prod)
-		wake_up(&queue->dealloc_wq);
+	if (dealloc_prod_save == queue->dealloc_prod)
+		wakeup = false;
 
 	spin_unlock_irqrestore(&queue->callback_lock, flags);
 
@@ -1717,7 +1717,7 @@ void xenvif_zerocopy_callback(struct ubuf_info *ubuf, bool zerocopy_success)
 		queue->stats.tx_zerocopy_success++;
 	else
 		queue->stats.tx_zerocopy_fail++;
-	xenvif_skb_zerocopy_complete(queue);
+	xenvif_skb_zerocopy_complete(queue, wakeup);
 }
 
 static inline void xenvif_tx_dealloc_action(struct xenvif_queue *queue)
@@ -1891,7 +1891,8 @@ void xenvif_page_unmap(struct xenvif_queue *queue,
 			    (unsigned long)page_to_kaddr(*page),
 			    GNTMAP_host_map,
 			    handle);
-	ret = gnttab_unmap_refs(&tx_unmap_op, NULL, page, 1);
+	ret = gnttab_unmap_refs(&tx_unmap_op, NULL,
+				page, 1);
 	if (ret) {
 		netdev_err(queue->vif->dev,
 			   "Unmap fail: ret: %d host_addr: %llx handle: 0x%x status: %d\n",

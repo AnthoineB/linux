@@ -58,7 +58,8 @@ void xenvif_skb_zerocopy_prepare(struct xenvif_queue *queue,
 	atomic_inc(&queue->inflight_packets);
 }
 
-void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue)
+void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue,
+				  bool wakeup)
 {
 	atomic_dec(&queue->inflight_packets);
 
@@ -66,7 +67,8 @@ void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue)
 	 * that if kthread_stop() has already been called, the dealloc thread
 	 * does not wait forever with nothing to wake it.
 	 */
-	wake_up(&queue->dealloc_wq);
+	if (wakeup)
+		wake_up(&queue->dealloc_wq);
 }
 
 int xenvif_schedulable(struct xenvif *vif)

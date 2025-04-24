@@ -461,7 +461,8 @@ extern struct dentry *xen_netback_dbg_root;
 
 void xenvif_skb_zerocopy_prepare(struct xenvif_queue *queue,
 				 struct sk_buff *skb);
-void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue);
+void xenvif_skb_zerocopy_complete(struct xenvif_queue *queue,
+				  bool wakeup);
 
 /* Multicast control */
 bool xenvif_mcast_match(struct xenvif *vif, const u8 *addr);
