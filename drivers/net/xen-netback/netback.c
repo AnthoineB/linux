@@ -629,7 +629,7 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 	struct gnttab_map_grant_ref *gop = queue->tx_map_ops + *map_ops;
 	struct xen_netif_tx_request *txp = first;
 	bool use_persistent_gnts = queue->vif->persistent_grants;
-	bool map_pgrant = false;
+	bool map_pgrant;
 
 	nr_slots = shinfo->nr_frags + frag_overflow + 1;
 
@@ -643,8 +643,11 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 		int amount = data_len > txp->size ? txp->size : data_len;
 		struct persistent_gnt *persistent_gnt = NULL;
 		bool need_map = !use_persistent_gnts;
-		bool map_pgrant = false;
 		bool split = false;
+
+		index = pending_index(queue->pending_cons);
+		pending_idx = queue->pending_ring[index];
+		map_pgrant = false;
 
 		if (use_persistent_gnts) {
 			xenvif_tx_pgrant_available(queue, txp->gref,
@@ -682,8 +685,6 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 		cop->len = amount;
 		cop->flags = GNTCOPY_source_gref;
 
-		index = pending_index(queue->pending_cons);
-		pending_idx = queue->pending_ring[index];
 		callback_param(queue, pending_idx).ctx = NULL;
 		copy_pending_idx(skb, copy_count(skb)) = pending_idx;
 		if (!split)
@@ -727,6 +728,7 @@ skip_gop:
 			       txp, sizeof(*txp));
 	}
 
+	map_pgrant = false;
 	for (shinfo->nr_frags = 0; nr_slots > 0 && shinfo->nr_frags < MAX_SKB_FRAGS;
 	     nr_slots--) {
 		if (unlikely(!txp->size)) {
