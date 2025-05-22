@@ -613,9 +613,10 @@ static bool xenvif_tx_pgrant_available(struct xenvif_queue *queue,
 	busy = IS_ERR(persistent_gnt);
 	if (unlikely(busy))
 		persistent_gnt = NULL;
+        else
+                xenvif_pgrant_set(queue, pending_idx, persistent_gnt);
 
-	xenvif_pgrant_set(queue, pending_idx, persistent_gnt);
-	if (likely(persistent_gnt))
+	if (persistent_gnt)
 		return true;
 
 	/* Check if we can create another persistent grant */
@@ -643,7 +644,7 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 	struct gnttab_map_grant_ref *gop = queue->tx_map_ops + *map_ops;
 	struct xen_netif_tx_request *txp = first;
 	bool use_persistent_gnts = queue->vif->persistent_grants;
-	bool map_pgrant;
+	bool map_pgrant = false;
 
 	nr_slots = shinfo->nr_frags + frag_overflow + 1;
 
@@ -672,9 +673,8 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
 		index = pending_index(queue->pending_cons);
 		pending_idx = queue->pending_ring[index];
 		callback_param(queue, pending_idx).ctx = NULL;
-		map_pgrant = false;
 
-		if (use_persistent_gnts) {
+		if (use_persistent_gnts && !map_pgrant) {
                         netdev_err(queue->vif->dev,
                                    "%s:%d: pending_idx %u, gref %u\n",
                                    __func__, __LINE__, pending_idx, txp->gref);
@@ -687,10 +687,12 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
                                    offset, amount);
 		}
 
+#if 0
 		/* Don't cross local page boundary! */
 		if (cop->dest.offset + amount > XEN_PAGE_SIZE) {
 			amount = XEN_PAGE_SIZE - cop->dest.offset;
 		}
+#endif
 
 		if (persistent_gnt) {
 			void *saddr = page_to_kaddr(persistent_gnt->page);
@@ -700,7 +702,8 @@ static void xenvif_get_requests(struct xenvif_queue *queue,
                                    "%s:%d: data %px, offset %u, saddr %px, offset %u, amount %d\n",
                                    __func__, __LINE__, skb->data,
                                    offset, saddr, txp->offset, amount);
-			memcpy(skb->data, saddr + txp->offset, amount);
+			memcpy(skb->data + offset,
+                               saddr + txp->offset, amount);
 			goto skip_gop;
 		}
 
@@ -756,6 +759,7 @@ skip_gop:
 				xenvif_tx_create_map_op(queue, pending_idx, txp,
 							gop++, map_pgrant);
 
+                        map_pgrant = false;
 			if (txp == first)
 				txp = txfrags;
 			else
@@ -776,7 +780,6 @@ skip_gop:
                            __func__, __LINE__, need_map, nr_slots);
 	}
 
-	map_pgrant = false;
 	for (shinfo->nr_frags = 0; nr_slots > 0 && shinfo->nr_frags < MAX_SKB_FRAGS;
 	     nr_slots--) {
 		struct persistent_gnt *persistent_gnt = NULL;
@@ -799,19 +802,20 @@ skip_gop:
 		queue->pending_tx_info[pending_idx].extra_count = txp == first ? extra_count : 0;
                 netdev_err(queue->vif->dev,
                            "%s:%d: pending_idx %u, gref %u, map %d\n",
-                           __func__, __LINE__, pending_idx, txp->gref, map_needed);
-		if (map_needed && !xenvif_tx_pgrant_available(queue, txp->gref, pending_idx,
-						&map_pgrant))
+                           __func__, __LINE__, pending_idx, txp->gref, map_pgrant);
+		if (map_pgrant || !xenvif_tx_pgrant_available(queue, txp->gref, pending_idx,
+						&map_pgrant)) {
 			persistent_gnt = queue->tx_pgrants[pending_idx];
                         netdev_err(queue->vif->dev,
                                    "%s:%d: pgnt %px, map %d\n",
                                    __func__, __LINE__, persistent_gnt, map_pgrant);
 			xenvif_tx_create_map_op(queue, pending_idx, txp,
-						gop,
+						gop++,
 						map_pgrant);
+                }
 		++shinfo->nr_frags;
-		++gop;
 
+                map_pgrant = false;
 		if (txp == first)
 			txp = txfrags;
 		else
@@ -848,12 +852,12 @@ skip_gop:
                                    "%s:%d: pending_idx %u, gref %u\n",
                                    __func__, __LINE__, pending_idx, txp->gref);
 			if (!xenvif_tx_pgrant_available(queue, txp->gref, pending_idx,
-							&map_pgrant))
+							&map_pgrant)) {
 				xenvif_tx_create_map_op(queue, pending_idx, txp,
-							gop,
+							gop++,
 							map_pgrant);
+                        }
 			++shinfo->nr_frags;
-			++gop;
 		}
 
 		if (shinfo->nr_frags) {
